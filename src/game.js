@@ -30,6 +30,8 @@
   var IDENTITY_Q = new T.Quaternion();
   var SKY = 0xCFE7F0;
   var JOY_R = 56;
+  var JOY_DEAD = 0.14;
+  var PITCH_LIMIT = 1.5408;
 
   var DIFFS = {
     easy: { key: 'easy', label: '轻松', size: 11, items: 6, hint: true, braid: 0.34 },
@@ -37,7 +39,46 @@
     hard: { key: 'hard', label: '挑战', size: 21, items: 16, hint: false, braid: 0.2 }
   };
 
+  var PALETTES = [
+    { sky: 0xCFE7F0, wall: 0xEFE9DE, wallTop: 0xD9C9B0, floorA: '#F9F5EC', floorB: '#E8DFCC' },
+    { sky: 0xD3E8E1, wall: 0xE9EFE7, wallTop: 0xB7CFC1, floorA: '#F2F8F1', floorB: '#DDEADF' },
+    { sky: 0xF3E3D8, wall: 0xF4E7DB, wallTop: 0xD9BFA9, floorA: '#FBF1E8', floorB: '#EEDCCE' },
+    { sky: 0xE1E0EE, wall: 0xEAE6F1, wallTop: 0xC0B9D2, floorA: '#F5F3FA', floorB: '#E1DDEC' },
+    { sky: 0xD7E7F1, wall: 0xE5ECF1, wallTop: 0xB6C7D3, floorA: '#F3F8FB', floorB: '#DEE8F0' }
+  ];
+
+  var palette = PALETTES[0];
+  var playMode = 'campaign';
+  var campaignLevel = 1;
+  var campaignBest = 1;
+
+  function levelConfig(n) {
+    var lv = Math.max(1, Math.round(n) || 1);
+    var size = 11 + Math.floor((lv - 1) * 1.1) * 2;
+    if (size > 25) size = 25;
+    var items = Math.min(20, 6 + Math.floor((lv - 1) * 1.15));
+    var braid = Math.max(0.12, 0.34 - (lv - 1) * 0.02);
+    return { key: 'campaign', label: '第 ' + lv + ' 关', size: size, items: items, hint: lv <= 2, braid: braid, level: lv };
+  }
+
+  function currentConfig() {
+    if (playMode === 'campaign') return levelConfig(campaignLevel);
+    return DIFFS[difficulty] || DIFFS.normal;
+  }
+
+  function paletteFor(conf, isPreview) {
+    if (isPreview) return PALETTES[0];
+    var idx = playMode === 'campaign' ? (conf.level - 1) : 0;
+    return PALETTES[((idx % PALETTES.length) + PALETTES.length) % PALETTES.length];
+  }
+
   function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+
+  function angleDiff(from, to) {
+    var d = (to - from + Math.PI) % (Math.PI * 2);
+    if (d < 0) d += Math.PI * 2;
+    return d - Math.PI;
+  }
 
   function baseFov() {
     return camera && camera.aspect < 0.95 ? BASE_FOV - 2 : BASE_FOV;
@@ -95,6 +136,7 @@
     winCollect: byId('win-collect'),
     winBest: byId('win-best'),
     winRecord: byId('win-record'),
+    btnNext: byId('btn-next'),
     btnAgain: byId('btn-again'),
     btnNewmaze: byId('btn-newmaze'),
     btnMenu: byId('btn-menu'),
@@ -104,6 +146,17 @@
     sensRange: byId('sens-range'),
     sensValue: byId('sens-value'),
     soundToggle: byId('sound-toggle'),
+    smoothRange: byId('smooth-range'),
+    smoothValue: byId('smooth-value'),
+    leftyToggle: byId('lefty-toggle'),
+    levelPill: byId('level-pill'),
+    levelText: byId('level-text'),
+    winTitle: document.querySelector('#screen-win .win-title'),
+    winSub: byId('win-sub'),
+    campLevel: byId('camp-level'),
+    campBest: byId('camp-best'),
+    levelBanner: byId('level-banner'),
+    levelBannerText: byId('level-banner-text'),
     toast: byId('toast'),
     noWebgl: byId('no-webgl')
   };
@@ -216,6 +269,17 @@
   var look = { id: null, lx: 0, ly: 0 };
   var joyX = 0;
   var joyY = 0;
+  var lookAccumX = 0;
+  var lookAccumY = 0;
+  var camYaw = 0;
+  var camPitch = 0;
+  var lookSmoothing = 0;
+  var leftyMode = false;
+
+  function syncView() {
+    camYaw = player.yaw;
+    camPitch = player.pitch;
+  }
 
   var actx = null;
   var noiseBuffer = null;
@@ -225,15 +289,15 @@
 
   var minimapCtx = els.minimap && els.minimap.getContext ? els.minimap.getContext('2d') : null;
 
-  function makeCheckerTexture() {
+  function makeCheckerTexture(a, b) {
     var size = 256;
     var canvas = document.createElement('canvas');
     canvas.width = size;
     canvas.height = size;
     var ctx = canvas.getContext('2d');
-    ctx.fillStyle = '#F9F5EC';
+    ctx.fillStyle = a || '#F9F5EC';
     ctx.fillRect(0, 0, size, size);
-    ctx.fillStyle = '#E8DFCC';
+    ctx.fillStyle = b || '#E8DFCC';
     ctx.fillRect(0, 0, size / 2, size / 2);
     ctx.fillRect(size / 2, size / 2, size / 2, size / 2);
     for (var i = 0; i < 700; i++) {
@@ -324,7 +388,7 @@
   }
 
   function buildFloor() {
-    var texture = makeCheckerTexture();
+    var texture = makeCheckerTexture(palette.floorA, palette.floorB);
     texture.repeat.set(maze.width, maze.height);
     var geometry = new T.PlaneGeometry(maze.width * CELL, maze.height * CELL);
     var material = new T.MeshLambertMaterial({ map: texture });
@@ -346,11 +410,11 @@
     if (!count) return;
 
     var wallGeometry = new T.BoxGeometry(CELL, WALL_H, CELL);
-    var wallMaterial = new T.MeshLambertMaterial({ color: 0xEFE9DE, flatShading: true });
+    var wallMaterial = new T.MeshLambertMaterial({ color: palette.wall, flatShading: true });
     var walls = new T.InstancedMesh(wallGeometry, wallMaterial, count);
 
     var capGeometry = new T.BoxGeometry(CELL * 1.015, 0.16, CELL * 1.015);
-    var capMaterial = new T.MeshLambertMaterial({ color: 0xD9C9B0, flatShading: true });
+    var capMaterial = new T.MeshLambertMaterial({ color: palette.wallTop, flatShading: true });
     var caps = new T.InstancedMesh(capGeometry, capMaterial, count);
 
     var matrix = new T.Matrix4();
@@ -683,7 +747,7 @@
     level.add(itemGroup);
 
     var rng = C.createRng((seed >>> 0) ^ 0x9E3779B9);
-    var cells = C.pickItemCells(maze, DIFFS[difficulty].items, rng, { start: maze.startCell, minDistFromStart: 3 });
+    var cells = C.pickItemCells(maze, currentConfig().items, rng, { start: maze.startCell, minDistFromStart: 3 });
     itemTotal = cells.length;
     items = [];
 
@@ -741,7 +805,10 @@
 
   function buildLevel(levelSeed, isPreview) {
     clearLevel();
-    var conf = DIFFS[difficulty];
+    var conf = currentConfig();
+    palette = paletteFor(conf, isPreview);
+    scene.background.setHex(palette.sky);
+    scene.fog.color.setHex(palette.sky);
     maze = C.generateMaze(conf.size, conf.size, { seed: levelSeed, braid: conf.braid });
     seed = maze.seed;
     exploration = C.createExploration(maze);
@@ -760,6 +827,9 @@
     player.z = (maze.entry.y + 0.5) * CELL;
     player.yaw = openingYaw();
     player.pitch = 0;
+    lookAccumX = 0;
+    lookAccumY = 0;
+    syncView();
     vel.x = 0;
     vel.z = 0;
     bobPhase = 0;
@@ -785,21 +855,26 @@
       camera.updateProjectionMatrix();
       C.castVision(exploration, maze, player.x, player.z, CELL, { radius: 12, rays: 72 });
       camera.position.set(player.x, camera.aspect < 0.95 ? PORTRAIT_EYE : EYE, player.z);
-      camera.rotation.set(player.pitch, player.yaw, 0);
+      camera.rotation.set(camPitch, camYaw, 0);
     } else {
       scene.fog.near = 90;
       scene.fog.far = 260;
     }
   }
 
-  function startGame(diffKey, opts, forced) {
+  function startGame(modeKey, opts, forced) {
     if (!renderer || generating) return;
     if (state === 'playing' && !forced) return;
     generating = true;
     try {
       opts = opts || {};
-      if (diffKey && DIFFS[diffKey]) difficulty = diffKey;
+      if (modeKey === 'campaign') playMode = 'campaign';
+      else if (modeKey && DIFFS[modeKey]) { playMode = 'free'; difficulty = modeKey; }
+      if (opts.mode === 'campaign' || opts.mode === 'free') playMode = opts.mode;
+      if (playMode === 'campaign') campaignLevel = Math.max(1, Math.round(opts.level !== undefined ? opts.level : campaignLevel) || 1);
+      save('mistymaze.mode', playMode);
       save('mistymaze.difficulty', difficulty);
+      applyModeUI();
       syncDifficultyUI();
       var useSeed = opts.seed !== undefined && opts.seed !== null ? (opts.seed >>> 0) : ((Math.random() * 4294967296) >>> 0);
       buildLevel(useSeed, false);
@@ -812,6 +887,7 @@
       updateStamina();
       drawMinimap(true);
       applyHint();
+      if (playMode === 'campaign') showLevelBanner('第 ' + campaignLevel + ' 关');
       if (!touchMode) toast('点击画面锁定鼠标视角', 2400);
     } catch (err) {
       errors.push('start: ' + (err && err.message ? err.message : String(err)));
@@ -904,6 +980,16 @@
     els.winCollect.textContent = collected + ' / ' + itemTotal;
     els.winBest.textContent = C.formatTime(record ? seconds : best.time);
     els.winRecord.classList.toggle('on', !!record);
+    if (playMode === 'campaign') {
+      if (campaignLevel + 1 > campaignBest) campaignBest = campaignLevel + 1;
+      save('mistymaze.campaign', JSON.stringify({ level: campaignLevel + 1, best: campaignBest }));
+      if (els.winTitle) els.winTitle.textContent = '第 ' + campaignLevel + ' 关完成';
+      if (els.winSub) els.winSub.textContent = '下一张迷宫已经准备好';
+      if (els.btnNext) els.btnNext.textContent = '进入第 ' + (campaignLevel + 1) + ' 关';
+    } else {
+      if (els.winTitle) els.winTitle.textContent = '你走出了雾';
+      if (els.winSub) els.winSub.textContent = '出口的薄荷色光在身后慢慢合拢';
+    }
     showScreen('win');
   }
 
@@ -959,6 +1045,30 @@
     }, ms || 2200);
   }
 
+  var levelBannerTimer = 0;
+
+  function showLevelBanner(text) {
+    if (!els.levelBanner || !els.levelBannerText) return;
+    els.levelBannerText.textContent = text;
+    els.levelBanner.classList.add('on');
+    if (levelBannerTimer) clearTimeout(levelBannerTimer);
+    levelBannerTimer = setTimeout(function () {
+      els.levelBanner.classList.remove('on');
+    }, 1500);
+  }
+
+  function applyModeUI() {
+    document.body.classList.toggle('campaign', playMode === 'campaign');
+    if (els.campLevel) els.campLevel.textContent = campaignLevel;
+    if (els.campBest) els.campBest.textContent = campaignBest;
+    if (els.levelText) els.levelText.textContent = playMode === 'campaign' ? ('第 ' + campaignLevel + ' 关') : '自由';
+    var modeBtns = document.querySelectorAll('[data-mode]');
+    for (var i = 0; i < modeBtns.length; i++) {
+      modeBtns[i].setAttribute('aria-selected', modeBtns[i].getAttribute('data-mode') === playMode ? 'true' : 'false');
+    }
+    if (els.btnStart) els.btnStart.textContent = playMode === 'campaign' ? '开始闯关' : '开始探索';
+  }
+
   function syncDifficultyUI() {
     var cards = document.querySelectorAll('[data-difficulty]');
     for (var i = 0; i < cards.length; i++) {
@@ -987,7 +1097,7 @@
   }
 
   function applyHint() {
-    var on = !!(DIFFS[difficulty] && DIFFS[difficulty].hint && state === 'playing');
+    var on = !!(currentConfig().hint && state === 'playing');
     document.body.classList.toggle('hint-on', on);
   }
 
@@ -1025,9 +1135,13 @@
     if (document.pointerLockElement === el) return;
     if (!el.requestPointerLock) return;
     try {
-      var p = el.requestPointerLock();
-      if (p && typeof p.catch === 'function') p.catch(function () {});
-    } catch (err) {}
+      var p = el.requestPointerLock({ unadjustedMovement: true });
+      if (p && typeof p.catch === 'function') p.catch(function () {
+        try { el.requestPointerLock(); } catch (e2) {}
+      });
+    } catch (err) {
+      try { el.requestPointerLock(); } catch (e3) {}
+    }
   }
 
   function resetKeys() {
@@ -1118,7 +1232,25 @@
     checkPickups();
   }
 
+  function consumeLook() {
+    if (!lookAccumX && !lookAccumY) return;
+    var radPerPx = sens * 0.002;
+    player.yaw -= lookAccumX * radPerPx;
+    player.pitch = clamp(player.pitch - lookAccumY * radPerPx, -PITCH_LIMIT, PITCH_LIMIT);
+    lookAccumX = 0;
+    lookAccumY = 0;
+  }
+
   function updateCameraView(dt) {
+    consumeLook();
+    if (lookSmoothing <= 0.001) {
+      camYaw = player.yaw;
+      camPitch = player.pitch;
+    } else {
+      var sk = 1 - Math.exp(-(34 - lookSmoothing * 26) * dt);
+      camYaw += angleDiff(camYaw, player.yaw) * sk;
+      camPitch += (player.pitch - camPitch) * sk;
+    }
     var speedNow = Math.sqrt(vel.x * vel.x + vel.z * vel.z);
     var bobAmp = Math.min(1, speedNow / SPEED);
     bobPhase += dt * (5.6 + speedNow * 1.15);
@@ -1127,11 +1259,11 @@
     var eye = portrait ? PORTRAIT_EYE : EYE;
 
     camera.position.set(player.x, eye + bob, player.z);
-    camera.rotation.set(player.pitch + Math.sin(bobPhase) * 0.005 * bobAmp, player.yaw, 0);
+    camera.rotation.set(camPitch + Math.sin(bobPhase) * 0.005 * bobAmp, camYaw, 0);
 
     if (bumpShake > 0.001) {
       var wobble = Math.sin(clock.elapsedTime * 48) * bumpShake;
-      camera.rotation.x = player.pitch + wobble * 0.5;
+      camera.rotation.x = camPitch + wobble * 0.5;
       camera.rotation.z = wobble * 0.38;
       bumpShake = Math.max(0, bumpShake - dt * 1.15);
     }
@@ -1160,8 +1292,10 @@
       player.yaw = angleLerp(player.yaw, winLook.yaw, k);
       player.pitch += (winLook.pitch - player.pitch) * k;
     }
+    camYaw = player.yaw;
+    camPitch = player.pitch;
     camera.position.set(player.x, (camera.aspect < 0.95 ? PORTRAIT_EYE : EYE) - 0.1, player.z);
-    camera.rotation.set(player.pitch, player.yaw, 0);
+    camera.rotation.set(camPitch, camYaw, 0);
     if (!winShown && elapsed > 780) showWinPanel();
   }
 
@@ -1428,7 +1562,7 @@
 
   function updateExitHint() {
     if (!els.exitHint) return;
-    if (!DIFFS[difficulty].hint || state !== 'playing') return;
+    if (!currentConfig().hint || state !== 'playing') return;
     var dx = exitPos.x - player.x;
     var dz = exitPos.z - player.z;
     var worldAngle = Math.atan2(dx, -dz);
@@ -1582,9 +1716,8 @@
   document.addEventListener('mousemove', function (event) {
     if (state !== 'playing') return;
     if (!renderer || document.pointerLockElement !== renderer.domElement) return;
-    var factor = sens * 0.0022;
-    player.yaw -= (event.movementX || 0) * factor;
-    player.pitch = clamp(player.pitch - (event.movementY || 0) * factor * 0.85, -1.45, 1.45);
+    lookAccumX += (event.movementX || 0);
+    lookAccumY += (event.movementY || 0);
   });
 
   document.addEventListener('visibilitychange', function () {
@@ -1625,8 +1758,19 @@
         dx = dx / len * JOY_R;
         dy = dy / len * JOY_R;
       }
-      joyX = dx / JOY_R;
-      joyY = dy / JOY_R;
+      var nx = dx / JOY_R;
+      var ny = dy / JOY_R;
+      var nlen = Math.sqrt(nx * nx + ny * ny);
+      if (nlen < JOY_DEAD) {
+        nx = 0;
+        ny = 0;
+      } else {
+        var scaled = ((nlen - JOY_DEAD) / (1 - JOY_DEAD)) / nlen;
+        nx *= scaled;
+        ny *= scaled;
+      }
+      joyX = nx;
+      joyY = ny;
       els.joyKnob.style.transform = 'translate3d(' + dx.toFixed(1) + 'px,' + dy.toFixed(1) + 'px,0)';
     }
   }, { passive: false });
@@ -1667,8 +1811,9 @@
       look.lx = touch.clientX;
       look.ly = touch.clientY;
       if (state === 'playing') {
-        player.yaw -= dx * 0.0042 * sens;
-        player.pitch = clamp(player.pitch - dy * 0.0036 * sens, -1.45, 1.45);
+        var tRad = sens * 0.0042;
+        player.yaw -= dx * tRad;
+        player.pitch = clamp(player.pitch - dy * tRad, -PITCH_LIMIT, PITCH_LIMIT);
       }
     }
   }, { passive: false });
@@ -1696,17 +1841,37 @@
     });
   }
 
+  var modeCards = document.querySelectorAll('[data-mode]');
+  for (var mc = 0; mc < modeCards.length; mc++) {
+    modeCards[mc].addEventListener('click', function () {
+      playMode = this.getAttribute('data-mode') === 'free' ? 'free' : 'campaign';
+      save('mistymaze.mode', playMode);
+      applyModeUI();
+      applyHint();
+      buildLevel((Math.random() * 4294967296) >>> 0, true);
+      previewAngle = 0.6;
+    });
+  }
+
   els.btnStart.addEventListener('click', function () {
     unlockAudio();
-    startGame(difficulty);
+    if (playMode === 'campaign') startGame('campaign', { level: campaignLevel });
+    else startGame('free', { mode: 'free' });
   });
 
-  els.btnAgain.addEventListener('click', function () { startGame(difficulty, { seed: seed }); });
-  els.btnNewmaze.addEventListener('click', function () { startGame(difficulty); });
+  els.btnNext.addEventListener('click', function () {
+    startGame('campaign', { level: campaignLevel + 1 });
+  });
+  els.btnAgain.addEventListener('click', function () {
+    startGame(playMode === 'campaign' ? 'campaign' : 'free', { seed: seed, level: campaignLevel });
+  });
+  els.btnNewmaze.addEventListener('click', function () {
+    startGame(playMode === 'campaign' ? 'campaign' : 'free', { level: campaignLevel });
+  });
   els.btnMenu.addEventListener('click', function () { toMenu(); });
 
   els.btnResume.addEventListener('click', function () { resumeGame(); });
-  els.btnRestart.addEventListener('click', function () { startGame(difficulty, { seed: seed }); });
+  els.btnRestart.addEventListener('click', function () { startGame(playMode === 'campaign' ? 'campaign' : 'free', { seed: seed, level: campaignLevel }); });
   els.btnQuit.addEventListener('click', function () { toMenu(); });
 
   els.btnPause.addEventListener('click', function () {
@@ -1722,6 +1887,36 @@
   els.btnFullscreen.addEventListener('click', function () { toggleFullscreen(); });
 
   els.sensRange.addEventListener('input', function () { applySens(this.value); });
+
+  els.smoothRange.addEventListener('input', function () {
+    lookSmoothing = clamp(parseFloat(this.value) || 0, 0, 0.8);
+    if (els.smoothValue) els.smoothValue.textContent = lookSmoothing < 0.01 ? '关' : lookSmoothing.toFixed(2);
+    save('mistymaze.smooth', String(lookSmoothing));
+  });
+
+  els.leftyToggle.addEventListener('click', function () {
+    leftyMode = !leftyMode;
+    document.body.classList.toggle('lefty', leftyMode);
+    this.setAttribute('aria-pressed', leftyMode ? 'true' : 'false');
+    save('mistymaze.lefty', leftyMode ? '1' : '0');
+  });
+
+  (function initPrefs() {
+    var modeSaved = load('mistymaze.mode', '');
+    if (modeSaved === 'free' || modeSaved === 'campaign') playMode = modeSaved;
+    var camp = null;
+    try { camp = JSON.parse(load('mistymaze.campaign', '')); } catch (e) { camp = null; }
+    if (camp && camp.level) campaignLevel = Math.max(1, camp.level | 0);
+    if (camp && camp.best) campaignBest = Math.max(campaignLevel, camp.best | 0);
+    var smoothSaved = parseFloat(load('mistymaze.smooth', '0'));
+    lookSmoothing = isFinite(smoothSaved) ? clamp(smoothSaved, 0, 0.8) : 0;
+    if (els.smoothRange) els.smoothRange.value = String(lookSmoothing);
+    if (els.smoothValue) els.smoothValue.textContent = lookSmoothing < 0.01 ? '关' : lookSmoothing.toFixed(2);
+    leftyMode = load('mistymaze.lefty', '0') === '1';
+    document.body.classList.toggle('lefty', leftyMode);
+    if (els.leftyToggle) els.leftyToggle.setAttribute('aria-pressed', leftyMode ? 'true' : 'false');
+    applyModeUI();
+  })();
 
   window.addEventListener('resize', function () {
     if (renderer) {
@@ -1818,7 +2013,15 @@
       }
       return total;
     },
-    start: function (diff) { startGame(DIFFS[diff] ? diff : difficulty, null, true); },
+    start: function (key, level) {
+      if (key === 'campaign') startGame('campaign', { level: level || campaignLevel }, true);
+      else if (DIFFS[key]) startGame(key, { mode: 'free' }, true);
+      else startGame(playMode === 'campaign' ? 'campaign' : 'free', { level: campaignLevel }, true);
+    },
+    level: function () { return campaignLevel; },
+    mode: function () { return playMode; },
+    cam: function () { return { yaw: camYaw, pitch: camPitch }; },
+    palette: function () { return { sky: palette.sky, wall: palette.wall, wallTop: palette.wallTop, floorA: palette.floorA }; },
     teleport: function (x, z) {
       player.x = Number(x) || 0;
       player.z = Number(z) || 0;
@@ -1829,7 +2032,7 @@
         drawMinimap(true);
       }
     },
-    setYaw: function (rad) { player.yaw = Number(rad) || 0; },
+    setYaw: function (rad) { player.yaw = Number(rad) || 0; syncView(); },
     frame: function () { return frameCount; },
     errors: function () { return errors.slice(); }
   };
