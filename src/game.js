@@ -805,7 +805,7 @@
 
   function buildLevel(levelSeed, isPreview) {
     clearLevel();
-    var conf = currentConfig();
+    var conf = isPreview ? { size: 13, items: 2, braid: 0.3, hint: false, level: 1 } : currentConfig();
     palette = paletteFor(conf, isPreview);
     scene.background.setHex(palette.sky);
     scene.fog.color.setHex(palette.sky);
@@ -901,6 +901,10 @@
     if (document.pointerLockElement && document.exitPointerLock) document.exitPointerLock();
     showScreen('start');
     clearToast();
+    var campSaved = null;
+    try { campSaved = JSON.parse(load('mistymaze.campaign', '')); } catch (e) { campSaved = null; }
+    if (campSaved && campSaved.level) campaignLevel = Math.max(campaignLevel, campSaved.level | 0);
+    applyModeUI();
     buildLevel((Math.random() * 4294967296) >>> 0, true);
     previewAngle = 0.6;
     camera.fov = 56;
